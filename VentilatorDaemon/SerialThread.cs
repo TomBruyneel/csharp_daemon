@@ -1,29 +1,19 @@
-﻿using Flurl.Http;
-using MongoDB.Bson.Serialization.Attributes;
-using MongoDB.Driver;
+﻿using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Dynamic;
 using System.IO.Ports;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using VentilatorDaemon.Helpers.Console;
+using VentilatorDaemon.Helpers.Serial;
+using VentilatorDaemon.Models;
+using VentilatorDaemon.Services;
 
 namespace VentilatorDaemon
 {
-    [BsonIgnoreExtraElements]
-    public class ValueEntry
-    {
-        [BsonElement("value")]
-        public float Value { get; set; }
-        [BsonElement("loggedAt")]
-        public DateTime LoggedAt { get; set; }
-    }
-
     public enum ConnectionState
     {
         SerialNotConnected = 0,
@@ -31,54 +21,21 @@ namespace VentilatorDaemon
         Connected = 2,
     }
 
-    public static class ByteArrayHelpers
-    {
-        public static bool StartsWith(this byte[] hayStack, byte[] needle)
-        {
-            for (int i = 0; i < Math.Min(hayStack.Length, needle.Length); i++)
-            {
-                if (hayStack[i] != needle[i])
-                {
-                    return false;
-                }
-            }
-
-            return true;
-        }
-
-        public static byte CalculateCrc(this byte[] message, int length)
-        {
-            byte checksum = 0;
-            for (var i = 0; i < length; i++)
-            {
-                checksum ^= message[i];
-            }
-
-            return checksum;
-        }
-    }
-
     public class SerialThread
     {
         private SerialPort serialPort = new SerialPort();
         private Object lockObj = new Object();
-        private SemaphoreSlim saveSettingLock = new SemaphoreSlim(1, 1);
-        private SemaphoreSlim saveMongoLock = new SemaphoreSlim(1, 1);
+
         private byte msgId = 0;
         private bool alarmReceived = false;
         private Task alarmSendTask = Task.CompletedTask;
         private Task ackTask = Task.CompletedTask;
         private DateTime lastMessageReceived;
 
-        private readonly uint ARDUINO_CONNECTION_NOT_OK = 256;
-
-        private uint alarmValue = 0;
-        private bool hasToSendAlarmReset = false;
-        private bool alarmMuted = false;
-
         private CancellationTokenSource ackTokenSource = new CancellationTokenSource();
 
-        FlurlClient flurlClient = new FlurlClient("http://localhost:3001");
+        private DateTime? arduinoTimeOffset = null;
+        private long timeAtOffset = 0;
 
         public List<Tuple<string, byte[]>> measurementIds = new List<Tuple<string, byte[]>>()
         {
@@ -113,45 +70,29 @@ namespace VentilatorDaemon
 
         private byte[] ack = ASCIIEncoding.ASCII.GetBytes("ACK=");
         private byte[] alarm = ASCIIEncoding.ASCII.GetBytes("ALARM=");
-        private readonly MongoClient client;
-        private readonly IMongoDatabase database;
+        private byte[] measurement = new byte[] { 0x02, 0x01 };
 
+        private readonly AlarmThread alarmThread;
+        private readonly IApiService apiService;
+        private readonly IDbService dbService;
+        private readonly ILogger<SerialThread> logger;
         private ConcurrentDictionary<byte, SentSerialMessage> waitingForAck = new ConcurrentDictionary<byte, SentSerialMessage>();
         private bool dtrEnable = false;
 
-        public SerialThread()
+        public SerialThread(IDbService dbService,
+            IApiService apiService,
+            AlarmThread alarmThread,
+            ILoggerFactory loggerFactory)
         {
+            this.logger = loggerFactory.CreateLogger<SerialThread>();
+
             serialPort.BaudRate = 115200;
             serialPort.ReadTimeout = 1500;
             serialPort.WriteTimeout = 1500;
 
-            client = new MongoClient("mongodb://localhost/beademing");
-            database = client.GetDatabase("beademing");
-        }
-
-        public uint AlarmValue
-        {
-            get => alarmValue;
-            set
-            {
-                alarmValue = alarmValue | value;
-
-                _= SendAlarmToServer(AlarmValue);
-            }
-        }
-
-        public bool AlarmMuted
-        {
-            get => alarmMuted;
-            set
-            {
-                alarmMuted = value;
-            }
-        }
-
-        private bool ShouldPlayAlarm
-        {
-            get => alarmValue > 0 && !alarmMuted;
+            this.alarmThread = alarmThread;
+            this.apiService = apiService;
+            this.dbService = dbService;
         }
 
         public ConnectionState ConnectionState { get; set; } = ConnectionState.SerialNotConnected;
@@ -185,6 +126,8 @@ namespace VentilatorDaemon
                     // send message
                     serialPort.Write(bytesToSend, 0, bytesToSend.Length);
 
+                    logger.LogTrace(bytesToSend.ToASCIIString());
+
                     msgId++;
                 }
                 catch (Exception) { }
@@ -211,79 +154,16 @@ namespace VentilatorDaemon
             }
         }
 
-        public void ResetAlarm()
-        {
-            hasToSendAlarmReset = true;
-        }
-
         public void PlayBeep()
         {
-            Console.Beep(3000, 2000);
-        }
-
-        public async Task SendAlarmToServer(uint value)
-        {
-            try
-            {
-                Dictionary<string, uint> dict = new Dictionary<string, uint>();
-                dict.Add("value", value);
-
-                await flurlClient.Request("/api/alarms")
-                    .PutJsonAsync(dict);
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine("Error while sending setting to server: {0}", e.Message);
-            }
-            finally
-            {
-            }
-        }
-
-        public async Task SendSettingToServer(string key, float value)
-        {
-            await saveSettingLock.WaitAsync();
-            try
-            {
-                Dictionary<string, float> dict = new Dictionary<string, float>();
-                dict.Add(key, value);
-
-                await flurlClient.Request("/api/settings")
-                    .PutJsonAsync(dict);
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine("Error while sending setting to server: {0}", e.Message);
-            }
-            finally
-            {
-                saveSettingLock.Release();
-            }
-        }
-
-        public async Task SendMeasurementToMongo(string collection, DateTime timeStamp, float value)
-        {
-            await saveMongoLock.WaitAsync();
-            try
-            {
-                await database.GetCollection<ValueEntry>(collection).InsertOneAsync(new ValueEntry()
-                {
-                    Value = value,
-                    LoggedAt = timeStamp,
-                });
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine("Error while sending setting to server: {0}", e.Message);
-            }
-            finally
-            {
-                saveMongoLock.Release();
-            }
+            //NetCoreAudio.Player player = new NetCoreAudio.Player();
+            //_ = player.Play(@"./assets/beep.wav");
         }
 
         public void HandleMessage(byte[] message, DateTime timeStamp)
         {
+            logger.LogTrace(message.ToASCIIString());
+
             this.lastMessageReceived = DateTime.Now;
             //calculate crc
             var crc = message.CalculateCrc(message.Length - 1);
@@ -313,14 +193,14 @@ namespace VentilatorDaemon
                 var messageId = message[message.Length - 3];
                 CreateAndSendAck(messageId);
 
-                var alarmString = ASCIIEncoding.ASCII.GetString(message);
+                var alarmString = message.ToASCIIString();
                 var tokens = alarmString.Split('=', StringSplitOptions.RemoveEmptyEntries);
 
                 uint newAlarmValue = 0;
                 if (uint.TryParse(tokens[1], out newAlarmValue))
                 {
-                    Console.WriteLine("Arduino sends alarmvalue: {0}", newAlarmValue);
-                    AlarmValue = newAlarmValue << 16;
+                    logger.LogTrace("Arduino sends alarmvalue: {0}", newAlarmValue);
+                    alarmThread.SetArduinoAlarmBits(newAlarmValue);
                 }
 
                 if (!alarmReceived)
@@ -331,35 +211,15 @@ namespace VentilatorDaemon
                     {
                         while (alarmReceived)
                         {
-                            uint alarmValueToSend = 0;
-
-                            if (hasToSendAlarmReset)
-                            {
-                                alarmValueToSend = (alarmValue & 0xFFFF0000) >> 16;
-
-                                if ((alarmValue & 0x0000FFFF) > 0)
-                                {
-                                    alarmValueToSend |= 1;
-                                }
-
-                                alarmValue = 0;
-                                hasToSendAlarmReset = false;
-                            }
-                            else
-                            {
-                                if (alarmValue > 0)
-                                {
-                                    alarmValueToSend = 1;
-                                }
-                            }
-
                             // send alarm ping
-                            var bytes = ASCIIEncoding.ASCII.GetBytes(string.Format("ALARM={0}", alarmValueToSend));
-                            Console.WriteLine("Send alarm {0} to arduino {1}", alarmValue, ASCIIEncoding.ASCII.GetString(bytes));
+                            var bytes = alarmThread.ComposeAlarmMessage();
+                            logger.LogTrace("Send alarm {0} to arduino {1}", alarmThread.AlarmValue, bytes.ToASCIIString());
                             WriteData(bytes);
 
                             await Task.Delay(500);
                         }
+
+                        logger.LogDebug("Stop alarm thread");
                     });
                 }
             }
@@ -376,17 +236,19 @@ namespace VentilatorDaemon
                         CreateAndSendAck(messageId);
 
                         //get value of the setting
-                        var settingString = ASCIIEncoding.ASCII.GetString(message);
+                        var settingString = message.ToASCIIString();
                         var tokens = settingString.Split('=', StringSplitOptions.RemoveEmptyEntries);
 
                         var floatValue = 0.0f;
 
                         if (float.TryParse(tokens[1], out floatValue))
                         {
+                            logger.LogInformation("Received setting from arduino with value {0} {1}", setting.Item1, floatValue);
+
                             // send to server
                             _ = Task.Run(async () =>
                              {
-                                 await SendSettingToServer(setting.Item1, floatValue);
+                                 await apiService.SendSettingToServerAsync(setting.Item1, floatValue);
                              });
                         }
 
@@ -397,51 +259,53 @@ namespace VentilatorDaemon
 
                 if (!handled)
                 {
-                    foreach (var measurement in measurementIds)
+                    if (message.StartsWith(measurement))
                     {
-                        if (message.StartsWith(measurement.Item2))
+                        // 0x02 0x01 {byte message length} {byte trigger} {two bytes V} {two bytes P} {two bytes TP} {two bytes BPM} {two bytes FLOW} {4 bytes time} {CRC byte}
+                        try
                         {
+                            var trigger = message[3];
+                            var volume = BitConverter.ToInt16(message, 4) / 10.0;
+                            var pressure = BitConverter.ToInt16(message, 6) / 100.0;
+                            var targetPressure = BitConverter.ToInt16(message, 8) / 100.0;
+                            var bpm = BitConverter.ToInt16(message, 10) / 100.0;
+                            var flow = BitConverter.ToInt16(message, 12) / 100.0;
+                            var time = BitConverter.ToUInt32(message, 14);                            
 
-                            var measurementString = ASCIIEncoding.ASCII.GetString(message);
-                            var tokens = measurementString.Split('=', StringSplitOptions.RemoveEmptyEntries);
-
-                            var floatValue = 0.0f;
-
-                            if (float.TryParse(tokens[1], out floatValue))
+                            if (!arduinoTimeOffset.HasValue || time - timeAtOffset > 120e3)
                             {
-                                floatValue = floatValue / 100.0f;
-                                // send to mongo
-                                _ = Task.Run(async () =>
-                                {
-                                    await SendMeasurementToMongo(measurement.Item1, timeStamp, floatValue);
-                                });
+                                arduinoTimeOffset = timeStamp.AddMilliseconds(-(time + 20));
+                                timeAtOffset = time;
                             }
 
-                            break;
+                            try
+                            {
+                                _= dbService.SendMeasurementValuesToMongoAsync(arduinoTimeOffset.Value.AddMilliseconds(time),
+                                    volume,
+                                    pressure,
+                                    targetPressure,
+                                    trigger,
+                                    flow,
+                                    bpm);
+                            }
+                            catch (Exception e)
+                            {
+                                logger.LogError("Error while saving measurements to mongo");
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            logger.LogError(e, e.Message);
                         }
                     }
                 }
             }
         }
 
-        private Task AlarmSoundTask(CancellationToken cancellationToken)
+        public Task Start(CancellationToken cancellationToken)
         {
-            return Task.Run(async () =>
-            {
-                while (!cancellationToken.IsCancellationRequested)
-                {
-                    if (ShouldPlayAlarm)
-                    {
-                        Console.Beep(3000, 2000);
-                    }
-                    await Task.Delay(400);
-                }
-            });
-        }
-
-        private Task SerialCommunicationTask(CancellationToken cancellationToken)
-        {
-            byte[] buffer = new byte[2048];
+            const int BUFFERLENGTH = 4096;
+            byte[] buffer = new byte[BUFFERLENGTH];
             int bufferOffset = 0;
 
             return Task.Run(async () =>
@@ -459,15 +323,18 @@ namespace VentilatorDaemon
 
                             waitingForAck.Clear();
                             serialPort.DtrEnable = dtrEnable;
+                            serialPort.RtsEnable = dtrEnable;
                             // next reconnection should not reset
                             dtrEnable = false;
-                            
+
                             serialPort.Open();
 
                             lastMessageReceived = DateTime.Now;
 
                             ackTokenSource = new CancellationTokenSource();
                             var token = ackTokenSource.Token;
+
+                            arduinoTimeOffset = null;
 
                             // thread that checks for messages to resend and connection problems
                             this.ackTask = Task.Run(async () =>
@@ -504,14 +371,17 @@ namespace VentilatorDaemon
 
                                     if ((DateTime.Now - this.lastMessageReceived).TotalSeconds > 20)
                                     {
-                                        Console.WriteLine("No communication with the arduino could be established, send reset signal");
+                                        logger.LogInformation("No communication with the arduino could be established, send reset signal");
 
-                                        /*dtrEnable = true;
-                                        if (serialPort.IsOpen)
+                                        if (Environment.OSVersion.Platform == PlatformID.Unix)
                                         {
-                                            serialPort.Close();
-                                            break;
-                                        }*/
+                                            dtrEnable = true;
+                                            if (serialPort.IsOpen)
+                                            {
+                                                serialPort.Close();
+                                                break;
+                                            }
+                                        }
                                     }
 
                                     await Task.Delay(1000);
@@ -521,30 +391,76 @@ namespace VentilatorDaemon
 
                         try
                         {
-                            int readBytes = await serialPort.BaseStream.ReadAsync(buffer, bufferOffset, 2048 - bufferOffset);
+                            int readBytes = await serialPort.BaseStream.ReadAsync(buffer, bufferOffset, BUFFERLENGTH - bufferOffset);
 
                             bufferOffset += readBytes;
 
-                            // get the messages out of the buffer by looking for line endings not preceded by =
+                            // get the messages out of the buffer by looking for line endings
+                            // this code is ugly, because at this moment it's a mix between ascii and binary protocol
+                            // measurements are received as such
+                            // 0x02 0x01 {byte message length} {byte trigger} {two bytes V} {two bytes P} {two bytes TP} {two bytes BPM} {two bytes FLOW} {4 bytes time} {CRC byte} {lineend}
+                            // all other messages (settings, alarms, acks) follow the MESSAGETYPE=VALUE=MESSAGE_ID=CRC format
                             var lengthMessage = 0;
                             var startMessage = 0;
                             var utcNow = DateTime.UtcNow;
+
+                            bool startByteEncountered = false;
+                            byte expectedMessageLength = 0;
+
                             for (int i = 0; i < bufferOffset; i++)
                             {
-                                if (buffer[i] == '\n' && lengthMessage > 1)
+                                // end of line message
+                                if (buffer[i] == '\n')
                                 {
-                                    byte[] message = new byte[lengthMessage - 1];
-                                    Array.Copy(buffer, startMessage, message, 0, lengthMessage - 1);
+                                    if (!startByteEncountered && lengthMessage > 1)
+                                    {
+                                        // we are in the ascii protocol
+                                        byte[] message = new byte[lengthMessage - 1];
+                                        Array.Copy(buffer, startMessage, message, 0, lengthMessage - 1);
 
-                                    startMessage = i + 1;
-                                    lengthMessage = -1;
+                                        startMessage = i + 1;
+                                        lengthMessage = -1;
 
-                                    _ = Task.Run(() => HandleMessage(message, utcNow));
+                                        _ = Task.Run(() => HandleMessage(message, utcNow));
+
+                                        startByteEncountered = false;
+                                    }
+                                    else if (startByteEncountered && lengthMessage == expectedMessageLength)
+                                    {
+                                        // we are in the binary protocol
+                                        byte[] message = new byte[lengthMessage];
+                                        Array.Copy(buffer, startMessage, message, 0, lengthMessage);
+
+                                        _ = Task.Run(() => HandleMessage(message, utcNow));
+
+                                        startMessage = i + 1;
+
+                                        lengthMessage = -1;
+                                        startByteEncountered = false;
+                                    }
+                                    else if (startByteEncountered && lengthMessage > expectedMessageLength)
+                                    {
+                                        // something went wrong, discard data
+                                        lengthMessage = -1;
+                                        startByteEncountered = false;
+                                    }
                                 }
+                                else if (buffer[i] == 0x02 && lengthMessage == 0)
+                                {
+                                    // start of binary protocol detected
+                                    startByteEncountered = true;
+
+                                    if (i + 2 < bufferOffset)
+                                    {
+                                        // we have to add the three start bytes (start, type and length) to the message length
+                                        expectedMessageLength = (byte)(buffer[i + 2] + 3);
+                                    }
+                                }
+
                                 lengthMessage++;
                             }
 
-                            // we found a message further in the buffer, shift the buffer
+                            // we found at least one message further in the buffer, shift the buffer
                             if (startMessage > 0)
                             {
                                 bufferOffset -= startMessage;
@@ -565,12 +481,10 @@ namespace VentilatorDaemon
                     }
                     catch (Exception e)
                     {
-                        // todo log error
-                        Console.WriteLine(e.Message);
+                        logger.LogError(e, e.Message);
                         await Task.Delay(1000);
                         ConnectionState = ConnectionState.SerialNotConnected;
-
-                        AlarmValue = ARDUINO_CONNECTION_NOT_OK;
+                        alarmReceived = false;
                     }
                 }
 
@@ -581,12 +495,11 @@ namespace VentilatorDaemon
             });
         }
 
-        public Task Start(CancellationToken cancellationToken)
+        public void SetPortName(string portName)
         {
-            return Task.WhenAll(
-                    AlarmSoundTask(cancellationToken),
-                    SerialCommunicationTask(cancellationToken)
-            );
+            serialPort.PortName = portName;
+
+            logger.LogInformation("Starting communication with {0}", serialPort.PortName);
         }
 
         public void SetPortName()
@@ -594,17 +507,27 @@ namespace VentilatorDaemon
             string portName = null;
 
             Console.WriteLine("Available Ports:");
+
+            while(SerialPort.GetPortNames().Count() == 0)
+            {
+                Thread.Sleep(1000);
+                logger.LogInformation("Waiting for serial ports to become available");
+            }
+
             foreach (string s in SerialPort.GetPortNames())
             {
-                if (String.IsNullOrWhiteSpace(portName))
+                if (s.IndexOf("ventilator") > -1)
                 {
-                    portName = s;
+                    serialPort.PortName = s;
+                    return;
                 }
+
+                portName = s;
                 Console.WriteLine("   {0}", s);
             }
 
             Console.Write("Enter COM port value (Default: {0}): ", portName);
-            string chosenPortName = Console.ReadLine();
+            string chosenPortName = Reader.ReadLine(5000, portName);
 
             if (string.IsNullOrWhiteSpace(chosenPortName))
             {
@@ -612,6 +535,8 @@ namespace VentilatorDaemon
             }
 
             serialPort.PortName = chosenPortName;
+
+            Console.WriteLine("Starting communication with {0}", serialPort.PortName);
         }
     }
 }

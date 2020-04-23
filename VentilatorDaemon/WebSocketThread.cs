@@ -5,6 +5,12 @@ using System.Net.WebSockets;
 using System.Threading.Tasks;
 using System.Threading;
 using Newtonsoft.Json.Linq;
+using VentilatorDaemon.Helpers.WebSocket;
+using VentilatorDaemon.Models;
+using Microsoft.Extensions.Logging;
+using System.Linq;
+using System.Data.SqlTypes;
+using VentilatorDaemon.Services;
 
 namespace VentilatorDaemon
 {
@@ -12,45 +18,73 @@ namespace VentilatorDaemon
     {
         private string uri;
         private readonly SerialThread serialThread;
+        private readonly AlarmThread alarmThread;
+        private readonly IApiService apiService;
+        private readonly ILogger<WebSocketThread> logger;
         private WebSocketWrapper webSocketWrapper;
 
-        private Dictionary<string, float> settings = new Dictionary<string, float>();
-
+        private CancellationTokenSource muteResetCancellationTokenSource = new CancellationTokenSource();
 
         private bool connected = false;
         private int id = 0;
 
-        private List<string> settingsToSendThrough = new List<string>()
+        private class SettingToSend
         {
-            "RR",   // Respiratory rate
-            "VT",   // Tidal Volume
-            "PK",   // Peak Pressure
-            "TS",   // Breath Trigger Threshold
-            "IE",   // Inspiration/Expiration (N for 1/N)
-            "PP",   // PEEP (positive end expiratory pressure)
-            "ADPK", // Allowed deviation Peak Pressure
-            "ADVT", // Allowed deviation Tidal Volume
-            "ADPP", // Allowed deviation PEEP
-            "MODE",  // Machine Mode (Volume Control / Pressure Control)
+            public SettingToSend(string settingKey, bool causesAlarmInactivity)
+            {
+                SettingKey = settingKey;
+                CausesAlarmInactivity = causesAlarmInactivity;
+            }
+
+            public string SettingKey { get; set; }
+            public bool CausesAlarmInactivity { get; set; }
+        }
+
+        private List<SettingToSend> settingsToSendThrough = new List<SettingToSend>()
+        {
+            new SettingToSend("RR", true),   // Respiratory rate
+            new SettingToSend("VT", true),   // Tidal Volume
+            new SettingToSend("PK", true),   // Peak Pressure
+            new SettingToSend("TS", true),   // Breath Trigger Threshold
+            new SettingToSend("IE", true),   // Inspiration/Expiration (N for 1/N)
+            new SettingToSend("PP", true),   // PEEP (positive end expiratory pressure)
+            new SettingToSend("ADPK", true), // Allowed deviation Peak Pressure
+            new SettingToSend("ADVT", true), // Allowed deviation Tidal Volume
+            new SettingToSend("ADPP", true), // Allowed deviation PEEP
+            new SettingToSend("MODE", false),  // Machine Mode (Volume Control / Pressure Control)
             //"ACTIVE",  // Machine on / off, do not send through automatically, we want to monitor ack
-            "PS", // support pressure
-            "RP", // ramp time
-            "TP", // trigger pressure
-            "MT", // mute
-            "FW", // firmware version
+            new SettingToSend("PS", false), // support pressure
+            new SettingToSend("RP", true), // ramp time
+            new SettingToSend("TP", true), // trigger pressure
+            new SettingToSend("MT", false), // mute
+            new SettingToSend("FW", false), // firmware version
         };
 
         private readonly string settingsPath = "/api/settings";
 
-        public WebSocketThread(string uri, SerialThread serialThread)
+        public WebSocketThread(ProgramSettings programSettings, 
+            SerialThread serialThread, 
+            AlarmThread alarmThread,
+            IApiService apiService,
+            ILoggerFactory loggerFactory)
         {
-            this.uri = uri;
+            this.uri = $"ws://{programSettings.WebServerHost}:3001";
             this.serialThread = serialThread;
+            this.alarmThread = alarmThread;
+            this.apiService = apiService;
+
+            this.logger = loggerFactory.CreateLogger<WebSocketThread>();
         }
 
         public Dictionary<string, float> Settings
         {
-            get => settings;
+            get;
+        } = new Dictionary<string, float>();
+
+        public DateTime LastSettingReceivedAt
+        {
+            private set;
+            get;
         }
 
         private async Task<WebSocketWrapper> ConnectWebSocket()
@@ -111,49 +145,84 @@ namespace VentilatorDaemon
                             {
                                 var name = property.Name;
                                 var propertyValue = property.Value.ToObject<float>();
-                                this.settings[name] = propertyValue;
+                                this.Settings[name] = propertyValue;
 
                                 if (name == "RA")
                                 {
-                                    serialThread.ResetAlarm();
+                                    alarmThread.ResetAlarm();
                                 }
                                 else if (name == "MT")
                                 {
-                                    serialThread.AlarmMuted = propertyValue > 0.0f;
+                                    alarmThread.AlarmMuted = propertyValue > 0.0f;
+
+                                    // we are only allowed to mute for one minute
+                                    if (propertyValue > 0.0f)
+                                    {
+                                        muteResetCancellationTokenSource.Cancel();
+                                        muteResetCancellationTokenSource = new CancellationTokenSource();
+                                        var cancellationToken = muteResetCancellationTokenSource.Token;
+
+                                        _ = Task.Run(async () =>
+                                        {
+                                            await Task.Delay(60000);
+
+                                            if (!cancellationToken.IsCancellationRequested)
+                                            {
+                                                logger.LogInformation("Resetting the mute state to zero");
+                                                await this.apiService.SendSettingToServerAsync("MT", 0);
+                                            }
+                                            
+                                        }, muteResetCancellationTokenSource.Token);
+                                    }
                                 }
                                 else if (name == "ACTIVE" && propertyValue >= 0.9f && propertyValue < 1.1f) // see if float value is close to 1
                                 {
                                     _ = Task.Run(() =>
                                     {
                                         // ACTIVE changed to 1, play short beep
-                                        Console.WriteLine("Change setting {0}={1}", name, propertyValue);
+                                        logger.LogInformation("Received setting from server: {0}={1}", name, propertyValue);
                                         var bytes = ASCIIEncoding.ASCII.GetBytes(string.Format("{0}={1}", name, propertyValue.ToString("0.00")));
 
                                         serialThread.WriteData(bytes, (messageId) =>
                                         {
+                                            logger.LogDebug("The machine should have played a beep after receiving active 1");
                                             serialThread.PlayBeep();
+                                            alarmThread.ResetAlarm();
+                                            alarmThread.SetInactive();
                                             return Task.CompletedTask;
                                         });
                                     });
                                 }
                                 else if (name == "ACTIVE")
                                 {
+                                    LastSettingReceivedAt = DateTime.Now;
+
                                     _ = Task.Run(() =>
                                     {
-                                        Console.WriteLine("Change setting {0}={1}", name, propertyValue);
+                                        logger.LogInformation("Received setting from server: {0}={1}", name, propertyValue);
                                         var bytes = ASCIIEncoding.ASCII.GetBytes(string.Format("{0}={1}", name, propertyValue.ToString("0.00")));
                                         serialThread.WriteData(bytes);
+
+                                        alarmThread.ResetAlarm();
+                                        alarmThread.SetInactive();
                                     });
                                 }
 
-                                if (settingsToSendThrough.Contains(name))
+                                var setting = settingsToSendThrough.FirstOrDefault(s => s.SettingKey == name);
+                                if (setting != null)
                                 {
+                                    LastSettingReceivedAt = DateTime.Now;
                                     _ = Task.Run(() =>
                                      {
-                                         Console.WriteLine("Change setting {0}={1}", name, propertyValue);
+                                         logger.LogInformation("Received setting from server: {0}={1}", name, propertyValue);
                                          var bytes = ASCIIEncoding.ASCII.GetBytes(string.Format("{0}={1}", name, propertyValue.ToString("0.00")));
                                          serialThread.WriteData(bytes);
                                      });
+
+                                    if (setting.CausesAlarmInactivity)
+                                    {
+                                        alarmThread.SetInactive();
+                                    }
                                 }
                             }
                         }
@@ -173,7 +242,7 @@ namespace VentilatorDaemon
                 catch (Exception e)
                 {
                     // todo log error
-                    Console.WriteLine(e.Message);
+                    logger.LogError(e, e.Message);
                 }
 
                 while (!cancellationToken.IsCancellationRequested)
@@ -187,7 +256,7 @@ namespace VentilatorDaemon
                         catch (Exception e)
                         {
                             // todo log error
-                            Console.WriteLine(e.Message);
+                            logger.LogDebug(e.Message);
                         }
                     }
 
